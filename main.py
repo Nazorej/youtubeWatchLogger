@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, date, time, timedelta
+
 from openpyxl import Workbook, load_workbook
 
 from excelFormatter import applyFullStyle
@@ -8,10 +9,38 @@ from ytService import fetchVideoData
 
 FILE_PATH = os.path.join(os.getcwd(), "youtube.xlsx")
 
-DAY_SHEET = "Статистика по дням"
-MONTH_SHEET = "Статистика по месяцам"
-YEAR_SHEET = "Статистика по годам"
-STATS_SHEETS = [DAY_SHEET, MONTH_SHEET, YEAR_SHEET]
+DATE_FMT = "dd.mm.yy"     # как дата отображается в Excel
+DUR_FMT = "[h]:mm:ss"     # формат длительности: часы не обнуляются после 24
+
+
+def asDate(value) -> date | None:
+    """Значение ячейки -> datetime.date (строки старого файла тоже понимаем)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return datetime.strptime(value, "%d.%m.%y").date()
+    return None
+
+
+def asSeconds(value) -> int | None:
+    """Значение ячейки -> секунды (timedelta / time / datetime-эпоха / строка)."""
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        return int(value.total_seconds())
+    if isinstance(value, time):
+        return value.hour * 3600 + value.minute * 60 + value.second
+    if isinstance(value, datetime):
+        # длительности > 24 ч openpyxl читает как datetime от 1899-12-30
+        return int((value - datetime(1899, 12, 30)).total_seconds())
+    if isinstance(value, str):
+        h, m, s = map(int, value.split(":"))
+        return h * 3600 + m * 60 + s
+    return None
 
 
 def openOrCreateWorkbook():
@@ -24,8 +53,7 @@ def openOrCreateWorkbook():
     ws.title = "Просмотры"
     ws.append(["Дата", "Время", "Автор", "ID", "Название"])
 
-    for name in STATS_SHEETS:
-        wb.create_sheet(name)
+    wb.create_sheet("Статистика по дням")
 
     return wb
 
@@ -38,6 +66,7 @@ def isDuplicate(ws, videoId: str) -> bool:
 
 
 def appendVideo(ws, data: dict):
+    row = ws.max_row + 1
     ws.append([
         data["date"],
         data["duration"],
@@ -45,66 +74,35 @@ def appendVideo(ws, data: dict):
         data["video_id"],
         data["title"]
     ])
+    # без явного формата длительность отобразится числом дней, а дата — числом
+    ws.cell(row=row, column=1).number_format = DATE_FMT
+    ws.cell(row=row, column=2).number_format = DUR_FMT
 
 
-def _toDate(value):
-    """Приводит значение из колонки 'Дата' к datetime.date.
-    Поддерживает как новые записи (date-объект), так и старые (строка dd.mm.yy)."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, str):
-        return datetime.strptime(value, "%d.%m.%y").date()
-    return value  # уже datetime.date
-
-
-def _toSeconds(value) -> int:
-    """Приводит значение из колонки 'Время' к количеству секунд.
-    Поддерживает как новые записи (timedelta), так и старые (строка HH:MM:SS)."""
-    if isinstance(value, timedelta):
-        return int(value.total_seconds())
-    if isinstance(value, str):
-        h, m, s = map(int, value.split(":"))
-        return h * 3600 + m * 60 + s
-    if hasattr(value, "hour"):  # datetime.time (на случай старого формата)
-        return value.hour * 3600 + value.minute * 60 + value.second
-    return 0
-
-
-def _rebuildStatsSheet(statsWs, headerLabel: str, stats: dict):
-    statsWs.delete_rows(1, statsWs.max_row)
-    statsWs.append([headerLabel, "Просмотрено"])
-
-    for key in sorted(stats.keys()):
-        statsWs.append([key, timedelta(seconds=stats[key])])
-
-
-def updateStatsSheets(wb):
+def updateStatsSheet(wb):
     ws = wb["Просмотры"]
+    statsWs = wb["Статистика по дням"]
 
-    dayStats = {}
-    monthStats = {}
-    yearStats = {}
+    stats: dict[date, int] = {}
 
     for row in ws.iter_rows(min_row=2, values_only=True):
-        date, duration = row[0], row[1]
+        d = asDate(row[0])
+        seconds = asSeconds(row[1])
 
-        if not date or duration is None:
+        if not d or seconds is None:
             continue
 
-        dateObj = _toDate(date)
-        seconds = _toSeconds(duration)
+        stats[d] = stats.get(d, 0) + seconds
 
-        dayStats[dateObj] = dayStats.get(dateObj, 0) + seconds
+    # очищаем, но оставляем заголовок
+    statsWs.delete_rows(1, statsWs.max_row)
+    statsWs.append(["Дата", "Просмотрено (HH:MM:SS)"])
 
-        monthKey = dateObj.replace(day=1)
-        monthStats[monthKey] = monthStats.get(monthKey, 0) + seconds
-
-        yearKey = dateObj.year
-        yearStats[yearKey] = yearStats.get(yearKey, 0) + seconds
-
-    _rebuildStatsSheet(wb[DAY_SHEET], "Дата", dayStats)
-    _rebuildStatsSheet(wb[MONTH_SHEET], "Месяц", monthStats)
-    _rebuildStatsSheet(wb[YEAR_SHEET], "Год", yearStats)
+    r = 2
+    for d in sorted(stats):   # date-объекты сортируются сами, strptime не нужен
+        statsWs.cell(row=r, column=1, value=d).number_format = DATE_FMT
+        statsWs.cell(row=r, column=2, value=timedelta(seconds=stats[d])).number_format = DUR_FMT
+        r += 1
 
 
 def processUrl(url: str):
@@ -121,12 +119,11 @@ def processUrl(url: str):
         return
 
     appendVideo(ws, data)
-    updateStatsSheets(wb)
+    updateStatsSheet(wb)
 
-    # применяем стиль ко всем листам
+    # применяем стиль
     applyFullStyle(ws)
-    for name in STATS_SHEETS:
-        applyFullStyle(wb[name])
+    applyFullStyle(wb["Статистика по дням"])
 
     wb.save(FILE_PATH)
 
@@ -134,4 +131,4 @@ def processUrl(url: str):
 
 
 if __name__ == "__main__":
-    processUrl("https://youtu.be/ВАШ_ID")
+    processUrl("https://youtu.be/WOvzyVwxN9M")
